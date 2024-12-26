@@ -1,0 +1,268 @@
+import optuna
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import random
+import numpy as np
+import json
+from optuna.samplers import TPESampler
+import gym
+
+# Teacher data setup for the Discriminator model
+file_path = "teacher_data.json"
+
+def load_teacher_data(file_path, config):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+    
+    teacher_data = {}
+    for key, id_lists in data.items():
+        # 位置と速度の組み合わせのキーを利用
+        teacher_data[key] = [
+            torch.tensor(ids + [0] * (config["num_heart"] - len(ids)), dtype=torch.long)
+            for ids in id_lists
+        ]
+    return teacher_data
+
+# Transformer Block with QKV Attention for State-Action Modeling
+class TransformerBlockWithQKV(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(TransformerBlockWithQKV, self).__init__()
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+        self.layernorm1 = nn.LayerNorm(embed_dim)
+        self.layernorm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, memory):
+        attn_output, _ = self.attention(x, memory, memory)
+        x = self.layernorm1(x + attn_output)
+        ff_output = self.feed_forward(x)
+        x = self.layernorm2(x + ff_output)
+        return x
+
+class StateActionTransformerWithQKV(nn.Module):
+    def __init__(self, state_dim, action_dim, embed_dim, num_heads, num_layers, num_heart, memory_length,
+                 shared_fc1, shared_transformer_blocks, shared_embedding):
+        super(StateActionTransformerWithQKV, self).__init__()
+        self.fc1 = shared_fc1
+        self.transformer_blocks1 = shared_transformer_blocks
+        self.fc2 = nn.Linear(embed_dim, num_heart)
+        self.embedding = shared_embedding
+        self.transformer_blocks2 = nn.ModuleList(
+            [TransformerBlockWithQKV(embed_dim, num_heads) for _ in range(num_layers)]
+        )
+        self.fc3 = nn.Linear(embed_dim, action_dim)
+        self.memory_length = memory_length
+        self.memory = torch.zeros(memory_length, 1, embed_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x)).unsqueeze(0).unsqueeze(1)
+        for transformer_block in self.transformer_blocks1:
+            x = transformer_block(x, self.memory)
+        
+        x = self.fc2(x.squeeze(0).squeeze(0))
+        x = torch.round(x * 10000).int()
+        
+        zero_indices = (x == 0).nonzero(as_tuple=True)[0]
+        if len(zero_indices) > 1:
+            x[zero_indices[1]:] = 0
+
+        x = self.embedding(x.clamp(0, 9999)).unsqueeze(0)
+        for transformer_block in self.transformer_blocks2:
+            x = transformer_block(x, x)
+
+        x = self.fc3(x.mean(dim=1)).clamp(-1, 1)  # MountainCarContinuousに合わせる
+        return x
+
+class Generator(nn.Module):
+    def __init__(self, state_dim, embed_dim, num_heads, num_layers, num_heart, shared_fc1, shared_transformer_blocks):
+        super(Generator, self).__init__()
+        self.fc1 = shared_fc1
+        self.transformer_blocks = shared_transformer_blocks
+        self.fc2 = nn.Linear(embed_dim, num_heart)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x)).unsqueeze(0)
+        for transformer_block in self.transformer_blocks:
+            x = transformer_block(x, x)
+        x = self.fc2(x).squeeze(0)
+        return torch.round(x * 10000).int()
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim, embed_dim, num_heads, num_layers, shared_embedding):
+        super(Discriminator, self).__init__()
+        self.embedding = shared_embedding
+        self.transformer_blocks = nn.ModuleList(
+            [TransformerBlockWithQKV(embed_dim, num_heads) for _ in range(num_layers)]
+        )
+        self.fc = nn.Linear(embed_dim, 1)
+
+    def forward(self, x):
+        x = self.embedding(x.clamp(0, 9999)).unsqueeze(0)
+        for transformer_block in self.transformer_blocks:
+            x = transformer_block(x, x)
+        x = x.mean(dim=1)
+        return torch.sigmoid(self.fc(x))
+
+def initialize_models(config):
+    shared_fc1 = nn.Linear(config["state_dim"], config["embed_dim"])
+    shared_transformer_blocks = nn.ModuleList(
+        [TransformerBlockWithQKV(config["embed_dim"], config["num_heads"]) for _ in range(config["num_layers"])]
+    )
+    shared_embedding = nn.Embedding(10000, config["embed_dim"])
+
+    rl_model = StateActionTransformerWithQKV(
+        config["state_dim"], config["action_dim"], config["embed_dim"], config["num_heads"], config["num_layers"],
+        config["num_heart"], config["memory_length"], shared_fc1, shared_transformer_blocks, shared_embedding
+    )
+    generator = Generator(
+        config["state_dim"], config["embed_dim"], config["num_heads"], config["num_layers"],
+        config["num_heart"], shared_fc1, shared_transformer_blocks
+    )
+    discriminator_embedding = nn.Embedding(10000, config["embed_dim"])
+    discriminator = Discriminator(
+        config["num_heart"], config["embed_dim"], config["num_heads"], config["num_layers"], discriminator_embedding
+    )
+    return rl_model, generator, discriminator
+
+
+def initialize_optimizers(models, config):
+    rl_optimizer = optim.Adam(models[0].parameters(), lr=config["learning_rate"] * config["rl_learning_rate_scale"])
+    gen_optimizer = optim.Adam(models[1].parameters(), lr=config["learning_rate"] * config["gen_learning_rate_scale"])
+    disc_optimizer = optim.Adam(models[2].parameters(), lr=config["learning_rate"] * config["disc_learning_rate_scale"])
+    return rl_optimizer, gen_optimizer, disc_optimizer
+
+def compute_discounted_rewards(rewards, gamma):
+    discounted_rewards = []
+    cumulative_reward = 0
+    for reward in reversed(rewards):
+        cumulative_reward = reward + gamma * cumulative_reward
+        discounted_rewards.insert(0, cumulative_reward)
+    return discounted_rewards
+
+class TrainingController:
+    def __init__(self, rl_model, generator, discriminator, rl_optimizer, gen_optimizer, disc_optimizer, rl_criterion, gen_criterion, disc_criterion, reward_scale):
+        self.rl_model = rl_model
+        self.generator = generator
+        self.discriminator = discriminator
+        self.rl_optimizer = rl_optimizer
+        self.gen_optimizer = gen_optimizer
+        self.disc_optimizer = disc_optimizer
+        self.rl_criterion = rl_criterion
+        self.gen_criterion = gen_criterion
+        self.disc_criterion = disc_criterion
+        self.reward_scale = reward_scale
+
+    def train_rl(self, states, discounted_rewards):
+        self.rl_optimizer.zero_grad()
+        rl_loss = -torch.tensor(discounted_rewards, requires_grad=True).sum()
+        rl_loss.backward()
+        self.rl_optimizer.step()
+        return rl_loss.item()
+
+    def train_gan(self, state, target_language_ids):
+        self.gen_optimizer.zero_grad()
+        generated_ids = self.generator(state)
+        fake_output_for_generator = self.discriminator(generated_ids)
+        gen_loss = self.gen_criterion(fake_output_for_generator, torch.ones_like(fake_output_for_generator))
+        gen_loss.backward()
+        self.gen_optimizer.step()
+        
+        self.disc_optimizer.zero_grad()
+        real_output = self.discriminator(target_language_ids)
+        real_loss = self.disc_criterion(real_output, torch.ones_like(real_output))
+        fake_output = self.discriminator(generated_ids.detach())
+        fake_loss = self.disc_criterion(fake_output, torch.zeros_like(fake_output))
+        disc_loss = real_loss + fake_loss
+        disc_loss.backward()
+        self.disc_optimizer.step()
+        
+        discriminator_reward = fake_output_for_generator.mean().item()
+        return gen_loss.item(), disc_loss.item(), discriminator_reward
+
+# Objective function for Optuna
+def objective(trial):
+    num_heads = trial.suggest_int("num_heads", 1, 4)
+    embed_dim = trial.suggest_int("embed_dim", 12, 24, step=12 // num_heads) * num_heads
+    config = {
+        "embed_dim": embed_dim,
+        "num_heads": num_heads,
+        "num_layers": trial.suggest_int("num_layers", 1, 2),
+        "action_dim": 1,
+        "state_dim": 2,  # MountainCarContinuousでは位置と速度の2次元
+        "num_heart": 20,
+        "memory_length": 10,
+        "reward_scale": 10,
+        "gamma": trial.suggest_float("gamma", 0.9, 0.95),
+        "learning_rate": trial.suggest_loguniform("learning_rate", 1e-5, 1e-4),
+        "rl_learning_rate_scale": 1.0,
+        "gen_learning_rate_scale": 0.5,
+        "disc_learning_rate_scale": 0.3,
+        "num_episodes": 50,
+        "steps_per_episode": 200  # MountainCarでは長めのエピソード
+    }
+
+    teacher_data = load_teacher_data(file_path, config)
+    rl_model, generator, discriminator = initialize_models(config)
+    rl_optimizer, gen_optimizer, disc_optimizer = initialize_optimizers([rl_model, generator, discriminator], config)
+    env = gym.make("MountainCarContinuous-v0")
+
+    controller = TrainingController(
+        rl_model=rl_model,
+        generator=generator,
+        discriminator=discriminator,
+        rl_optimizer=rl_optimizer,
+        gen_optimizer=gen_optimizer,
+        disc_optimizer=disc_optimizer,
+        rl_criterion=nn.MSELoss(),
+        gen_criterion=nn.BCELoss(),
+        disc_criterion=nn.BCELoss(),
+        reward_scale=config["reward_scale"]
+    )
+
+    total_rewards = 0
+    for episode in range(config["num_episodes"]):
+        state = torch.tensor(env.reset()[0], dtype=torch.float32)
+        rewards = []
+        states = []
+        episode_reward = 0  # エピソードごとの累積報酬を記録
+
+        for step in range(config["steps_per_episode"]):
+            action_vector = generator(state)
+            action = action_vector[0].item() / 10000  # [-1, 1]にスケーリング
+            next_state, reward, done, _, _ = env.step([action])
+            state = torch.tensor(next_state, dtype=torch.float32)
+
+            pos_vel_key = f"{round(state[0].item(), 3)}_{round(state[1].item(), 3)}"
+            direction_data_list = teacher_data.get(pos_vel_key, random.choice(list(teacher_data.values())))
+            target_language_ids = random.choice(direction_data_list)
+            gen_loss, disc_loss, discriminator_reward = controller.train_gan(state, target_language_ids)
+
+            rewards.append(reward + config["reward_scale"] * discriminator_reward)
+            states.append(state)
+
+            if done:
+                break
+
+        discounted_rewards = compute_discounted_rewards(rewards, config["gamma"])
+        rl_loss = controller.train_rl(states, discounted_rewards)
+        # エピソードごとのログ出力
+        print(f"Episode {episode + 1} completed: Total Reward: {episode_reward:.3f}, "
+              f"RL Loss: {rl_loss:.3f}, Gen Loss: {gen_loss:.3f}, Disc Loss: {disc_loss:.3f}")
+
+        total_rewards += sum(rewards)
+
+    return -total_rewards / config["num_episodes"]
+
+# Optuna study setup
+sampler = TPESampler()
+study = optuna.create_study(direction="maximize", sampler=sampler)
+study.optimize(objective, n_trials=50)
+
+# Best trial result
+print("Best trial:")
+print(study.best_trial)
