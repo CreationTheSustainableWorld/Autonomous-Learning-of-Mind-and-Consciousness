@@ -1,0 +1,1 @@
+Note: This model is currently undergoing modifications and updates. As of now, it is not fully functional. The goal is to develop and implement a core model for life forms with consciousness and emotions.
